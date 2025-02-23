@@ -1,30 +1,22 @@
-import mysql.connector
 import yfinance as yf
-from datetime import datetime
+import pandas as pd
+from database import insert_stock_data
 
-# MySQL 연결
-db = mysql.connector.connect(
-    host="localhost",
-    user="root",
-    password="0000",
-    database="stock_trading"
-)
-cursor = db.cursor()
-
-# 데이터 수집 함수
+# 📌 PLTR(팔란티어) 주식 데이터 가져오기
 def fetch_stock_data():
     stock = yf.Ticker("PLTR")
-    df = stock.history(period="1d", interval="1h")  # 1시간 간격 데이터
+    df = stock.history(period="1d", interval="1h")  # 최근 하루 동안 1시간 간격 데이터 가져오기
 
-    for index, row in df.iterrows():
-        query = """
-        INSERT INTO stock_data (date, open_price, high_price, low_price, close_price, volume)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """
-        values = (index.strftime("%Y-%m-%d %H:%M:%S"), row["Open"], row["High"], row["Low"], row["Close"], row["Volume"])
-        cursor.execute(query, values)
-        db.commit()
+    # 날짜 변환 (Datetime 형식으로)
+    df.reset_index(inplace=True)
+    df["Datetime"] = df["Datetime"].dt.strftime('%Y-%m-%d %H:%M:%S')
 
-fetch_stock_data()
-cursor.close()
-db.close()
+    # 필요한 데이터만 선택
+    stock_data = df[["Datetime", "Open", "High", "Low", "Close", "Volume"]].values.tolist()
+
+    return stock_data
+
+# 실행 함수
+if __name__ == "__main__":
+    data = fetch_stock_data()
+    insert_stock_data(data)
