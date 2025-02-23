@@ -5,7 +5,7 @@ from database import insert_stock_data
 # 📌 PLTR(팔란티어) 주식 데이터 가져오기
 def fetch_stock_data():
     stock = yf.Ticker("PLTR")
-    df = stock.history(period="1d", interval="1h")  # 최근 하루 동안 1시간 간격 데이터 가져오기
+    df = stock.history(period="1d", interval="1m")  # 최근 하루 동안 1분 간격 데이터 가져오기
 
     # 날짜 변환 (Datetime 형식으로)
     df.reset_index(inplace=True)
