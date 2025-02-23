@@ -11,3 +11,7 @@ CREATE TABLE stock_data (
     close_price FLOAT NOT NULL,
     volume BIGINT NOT NULL
 );
+
+select * from stock_data;
+
+drop table stock_data;
