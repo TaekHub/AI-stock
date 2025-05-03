@@ -11,6 +11,14 @@ import requests
 from newsapi import NewsApiClient
 import streamlit.components.v1 as components
 from textblob import TextBlob
+from dotenv import load_dotenv
+import os
+
+# 환경 변수 로드
+load_dotenv()
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 
 # Streamlit 앱 설정
 st.set_page_config(page_title="주식 투자 통합 분석 플랫폼", layout="wide")
@@ -25,12 +33,11 @@ if 'ticker' not in st.session_state:
     st.session_state['ticker'] = ''
 
 # 국내 종목 목록 로드 및 영어 매핑
-@st.cache_data
+@st.cache_data(ttl=86400)  # 24시간 캐시 유지
 def load_krx_tickers():
     try:
         tickers = stock.get_market_ticker_list(market="ALL")
         ticker_names = {stock.get_market_ticker_name(t): t for t in tickers}
-        # 간단한 영어 매핑 (실제로는 더 많은 매핑 필요)
         english_mapping = {
             "삼성전자": "Samsung Electronics",
             "현대차": "Hyundai Motor",
@@ -45,7 +52,7 @@ def load_krx_tickers():
         return {}
 
 # 데이터 로드 함수
-@st.cache_data
+@st.cache_data(ttl=3600)  # 1시간마다 갱신
 def load_data(ticker, market):
     try:
         if market == "해외 주식":
@@ -75,15 +82,13 @@ def load_data(ticker, market):
         return None
 
 # 네이버 뉴스 API로 국내 주식 뉴스 가져오기
+@st.cache_data(ttl=1800)  # 30분마다 갱신
 def fetch_naver_news(query):
     try:
-        # 네이버 API 클라이언트 ID와 시크릿 (사용자가 발급받아야 함)
-        client_id = "fq_IhoFPA7JE8RbkcaxU"  # 네이버 개발자 센터에서 발급받은 ID
-        client_secret = "DEol_zkdtF"  # 네이버 개발자 센터에서 발급받은 시크릿
         url = f"https://openapi.naver.com/v1/search/news.json?query={query}&display=15&sort=date"
         headers = {
-            "X-Naver-Client-Id": client_id,
-            "X-Naver-Client-Secret": client_secret
+            "X-Naver-Client-Id": NAVER_CLIENT_ID,
+            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
         }
         response = requests.get(url, headers=headers)
         if response.status_code != 200:
@@ -92,11 +97,10 @@ def fetch_naver_news(query):
         articles = response.json().get('items', [])
         news_items = []
         for article in articles:
-            title = article['title'].replace('&quot;', '"').replace('<b>', '').replace('</b>', '')
+            title = article['title'].replace('"', '"').replace('<b>', '').replace('</b>', '')
             url = article['link']
-            # 감정 분석 수행
             blob = TextBlob(title)
-            sentiment_score = blob.sentiment.polarity  # -1 (부정적) ~ 1 (긍정적)
+            sentiment_score = blob.sentiment.polarity
             if sentiment_score > 0:
                 sentiment = "긍정적"
                 sentiment_color = "green"
@@ -114,10 +118,10 @@ def fetch_naver_news(query):
         return []
 
 # NewsAPI로 해외 주식 뉴스 가져오기
+@st.cache_data(ttl=1800)  # 30분마다 갱신
 def fetch_newsapi(ticker):
     try:
-        api_key = "083a1379c93d4b33a420e41a5f64ee4c"
-        newsapi = NewsApiClient(api_key=api_key)
+        newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
         query = f"{ticker} stock"
         articles = newsapi.get_everything(
             q=query,

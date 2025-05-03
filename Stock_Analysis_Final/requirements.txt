@@ -5,3 +5,13 @@ yfinance
 matplotlib
 seaborn
 ta
+streamlit
+pandas
+yfinance
+pykrx
+ta-lib
+plotly
+numpy
+requests
+newsapi-python
+textblob
