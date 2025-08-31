@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "857654207887",
+    "project_id": "stock-analysis-623ae",
+    "storage_bucket": "stock-analysis-623ae.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:857654207887:android:fc2818c2d1cad8febd17fa",
+        "android_client_info": {
+          "package_name": "com.example.stock"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDNJAT9FT46n3pid-C8r-jQxpXsinxMi8A"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:857654207887:android:814776a021999f33bd17fa",
+        "android_client_info": {
+          "package_name": "com.example.stock_analysis_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDNJAT9FT46n3pid-C8r-jQxpXsinxMi8A"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
