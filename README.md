@@ -41,8 +41,6 @@ redis 서버가 있다면 삭제, 없다면 아까 아나콘다 프롬프트에�
 │   ├── android
 │       ├── app
 │           ├── build.gradle.kts
-|
-|
 │       ├── build.gradle.kts
 │       ├── settings.gradle.kts
 
