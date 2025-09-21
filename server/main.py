@@ -1,5 +1,4 @@
-# 파일명: main.py
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import talib
@@ -12,12 +11,25 @@ from datetime import datetime, timedelta
 import json
 import redis
 import logging
+from bs4 import BeautifulSoup
+from pandas_datareader import data as pdr
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Firebase 초기화
+try:
+    cred = credentials.Certificate('C:/Users/kbs01/AndroidStudioProjects/stock_analysis_app/stock-analysis-623ae-firebase-adminsdk-fbsvc-83459e76aa.json')  # 실제 서비스 계정 키 경로로 변경
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    logger.info("Firebase initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Firebase: {e}")
 
 # Redis 클라이언트 설정
 try:
@@ -57,512 +69,365 @@ KOREAN_TO_ENGLISH = {
     "삼성SDI": "Samsung SDI",
 }
 
-@app.get("/tickers")
-async def get_tickers(market: str = "KR"):
-    try:
-        # Redis 캐시 확인
-        if redis_client:
-            cache_key = f"tickers:{market}"
-            try:
-                cached_data = redis_client.get(cache_key)
-                if cached_data:
-                    logger.info(f"Cache hit for {cache_key}")
-                    if isinstance(cached_data, bytes):
-                        try:
-                            cached_data = cached_data.decode('utf-8')
-                        except UnicodeDecodeError as e:
-                            logger.error(f"Failed to decode cached data: {e}")
-                            redis_client.delete(cache_key)
-                            logger.info(f"Deleted invalid cache for {cache_key}")
-                            cached_data = None
-                    if cached_data:
-                        return JSONResponse(content=json.loads(cached_data), media_type="application/json; charset=utf-8")
-            except (redis.RedisError, json.JSONDecodeError) as e:
-                logger.error(f"Redis cache fetch error: {e}")
-                try:
-                    redis_client.delete(cache_key)
-                    logger.info(f"Deleted invalid cache for {cache_key}")
-                except redis.RedisError as e:
-                    logger.error(f"Redis delete error: {e}")
+# ---------- 야후 우회용 세션 ----------
+def _make_requests_session(timeout: int = 10) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+    return s
 
-        # 데이터 가져오기
-        if market == "KR":
-            try:
-                kospi_tickers = stock.get_market_ticker_list(market="KOSPI")
-                kosdaq_tickers = stock.get_market_ticker_list(market="KOSDAQ")
-            except Exception as e:
-                logger.error(f"pykrx 데이터 가져오기 실패: {e}")
-                kospi_tickers, kosdaq_tickers = [], []
-            tickers = kospi_tickers + kosdaq_tickers
-            ticker_names = [
-                {"ticker": ticker, "name": stock.get_market_ticker_name(ticker) or ticker}
-                for ticker in tickers
+# ---------- US 주식 OHLC 다운로더 (다단계 폴백) ----------
+def fetch_us_ohlc(ticker: str, period: str = "3mo", interval: str = "1d") -> pd.DataFrame:
+    """yfinance -> 기간확대 재시도 -> Stooq(pandas-datareader) -> Stooq CSV 순서로 시도"""
+    try:
+        sess = _make_requests_session()
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            session=sess,
+            timeout=12,
+        )
+        if df is not None and not df.empty:
+            return df
+        df = yf.download(
+            ticker,
+            period="1y",
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            session=sess,
+            timeout=12,
+        )
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        logger.warning(f"yfinance 1차 경로 실패({ticker}): {e}")
+
+    try:
+        end_date = datetime.today()
+        start_date = end_date - timedelta(days=90 if period == "3mo" else 365)
+        df = pdr.get_data_stooq(ticker, start=start_date, end=end_date)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        logger.warning(f"Stooq pandas-datareader 실패({ticker}): {e}")
+
+    try:
+        csv_url = f"https://stooq.com/q/d/l/?s={ticker}&i=d"
+        df = pd.read_csv(csv_url)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.set_index("Date", inplace=True)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        logger.error(f"Stooq CSV 다운로드 실패({ticker}): {e}")
+
+    logger.error(f"모든 경로에서 데이터 가져오기 실패({ticker})")
+    return pd.DataFrame()
+
+# ---------- 한국 주식 OHLC 다운로더 (pykrx) ----------
+def fetch_kr_ohlc(ticker: str, period: str = "3mo", interval: str = "1d") -> pd.DataFrame:
+    try:
+        end_date = datetime.today()
+        days = 90 if period == "3mo" else 365
+        start_date = (end_date - timedelta(days=days)).strftime("%Y%m%d")
+        end_date = end_date.strftime("%Y%m%d")
+        df = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
+        df = df.rename(columns={"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"})
+        df.index = pd.to_datetime(df.index)
+        df["Close"] = df["Close"].astype(float)
+        df["Volume"] = df["Volume"].astype(float)
+        return df
+    except Exception as e:
+        logger.error(f"pykrx 데이터 가져오기 실패({ticker}): {e}")
+        return pd.DataFrame()
+
+# ---------- 지표 계산기 ----------
+def calculate_indicators(df: pd.DataFrame):
+    indicators = {}
+    indicators_series = {}
+    try:
+        if df.empty or len(df) < 14:  # 최소 14일 데이터 필요
+            logger.warning("지표 계산을 위한 데이터 부족")
+            return indicators, indicators_series
+
+        # RSI
+        rsi = talib.RSI(df["Close"], timeperiod=14)
+        indicators["RSI"] = float(rsi.iloc[-1]) if not rsi.empty and not np.isnan(rsi.iloc[-1]) else None
+        indicators_series["RSI"] = [float(x) if not np.isnan(x) else None for x in rsi.tolist()]
+
+        # MACD
+        macd, macd_signal, macd_hist = talib.MACD(df["Close"], fastperiod=12, slowperiod=26, signalperiod=9)
+        indicators["MACD"] = float(macd.iloc[-1]) if not macd.empty and not np.isnan(macd.iloc[-1]) else None
+        indicators["MACD_prev"] = float(macd.iloc[-2]) if len(macd) > 1 and not np.isnan(macd.iloc[-2]) else None
+        indicators_series["MACD"] = [float(x) if not np.isnan(x) else None for x in macd.tolist()]
+
+        # CCI
+        cci = talib.CCI(df["High"], df["Low"], df["Close"], timeperiod=14)
+        indicators["CCI"] = float(cci.iloc[-1]) if not cci.empty and not np.isnan(cci.iloc[-1]) else None
+        indicators_series["CCI"] = [float(x) if not np.isnan(x) else None for x in cci.tolist()]
+
+        # MFI
+        mfi = talib.MFI(df["High"], df["Low"], df["Close"], df["Volume"], timeperiod=14)
+        indicators["MFI"] = float(mfi.iloc[-1]) if not mfi.empty and not np.isnan(mfi.iloc[-1]) else None
+        indicators_series["MFI"] = [float(x) if not np.isnan(x) else None for x in mfi.tolist()]
+
+        # ADX
+        adx = talib.ADX(df["High"], df["Low"], df["Close"], timeperiod=14)
+        indicators["ADX"] = float(adx.iloc[-1]) if not adx.empty and not np.isnan(adx.iloc[-1]) else None
+        indicators_series["ADX"] = [float(x) if not np.isnan(x) else None for x in adx.tolist()]
+
+        # Stochastic
+        slowk, slowd = talib.STOCH(df["High"], df["Low"], df["Close"], fastk_period=14, slowk_period=3, slowd_period=3)
+        indicators["SlowK"] = float(slowk.iloc[-1]) if not slowk.empty and not np.isnan(slowk.iloc[-1]) else None
+        indicators["SlowD"] = float(slowd.iloc[-1]) if not slowd.empty and not np.isnan(slowd.iloc[-1]) else None
+        indicators["SlowK_prev"] = float(slowk.iloc[-2]) if len(slowk) > 1 and not np.isnan(slowk.iloc[-2]) else None
+        indicators["SlowD_prev"] = float(slowd.iloc[-2]) if len(slowd) > 1 and not np.isnan(slowd.iloc[-2]) else None
+        indicators_series["SlowK"] = [float(x) if not np.isnan(x) else None for x in slowk.tolist()]
+        indicators_series["SlowD"] = [float(x) if not np.isnan(x) else None for x in slowd.tolist()]
+
+        # SMA
+        sma10 = talib.SMA(df["Close"], timeperiod=10)
+        sma50 = talib.SMA(df["Close"], timeperiod=50)
+        indicators["SMA10"] = float(sma10.iloc[-1]) if not sma10.empty and not np.isnan(sma10.iloc[-1]) else None
+        indicators["SMA50"] = float(sma50.iloc[-1]) if not sma50.empty and not np.isnan(sma50.iloc[-1]) else None
+        indicators["SMA10_prev"] = float(sma10.iloc[-2]) if len(sma10) > 1 and not np.isnan(sma10.iloc[-2]) else None
+        indicators["SMA50_prev"] = float(sma50.iloc[-2]) if len(sma50) > 1 and not np.isnan(sma50.iloc[-2]) else None
+        indicators_series["SMA10"] = [float(x) if not np.isnan(x) else None for x in sma10.tolist()]
+        indicators_series["SMA50"] = [float(x) if not np.isnan(x) else None for x in sma50.tolist()]
+
+        # EMA
+        ema20 = talib.EMA(df["Close"], timeperiod=20)
+        ema50 = talib.EMA(df["Close"], timeperiod=50)
+        indicators["EMA20"] = float(ema20.iloc[-1]) if not ema20.empty and not np.isnan(ema20.iloc[-1]) else None
+        indicators["EMA50"] = float(ema50.iloc[-1]) if not ema50.empty and not np.isnan(ema50.iloc[-1]) else None
+        indicators["EMA20_prev"] = float(ema20.iloc[-2]) if len(ema20) > 1 and not np.isnan(ema20.iloc[-2]) else None
+        indicators["EMA50_prev"] = float(ema50.iloc[-2]) if len(ema50) > 1 and not np.isnan(ema50.iloc[-2]) else None
+        indicators_series["EMA20"] = [float(x) if not np.isnan(x) else None for x in ema20.tolist()]
+        indicators_series["EMA50"] = [float(x) if not np.isnan(x) else None for x in ema50.tolist()]
+
+        # Bollinger Bands
+        upper, middle, lower = talib.BBANDS(df["Close"], timeperiod=20, nbdevup=2, nbdevdn=2)
+        indicators["BB_upper"] = float(upper.iloc[-1]) if not upper.empty and not np.isnan(upper.iloc[-1]) else None
+        indicators["BB_lower"] = float(lower.iloc[-1]) if not lower.empty and not np.isnan(lower.iloc[-1]) else None
+        indicators["close"] = float(df["Close"].iloc[-1]) if not df["Close"].empty else None
+        indicators_series["BB_upper"] = [float(x) if not np.isnan(x) else None for x in upper.tolist()]
+        indicators_series["BB_lower"] = [float(x) if not np.isnan(x) else None for x in lower.tolist()]
+
+        logger.info(f"Calculated indicators: {indicators}")
+        logger.info(f"Indicators series lengths: { {k: len(v) for k, v in indicators_series.items()} }")
+
+    except Exception as e:
+        logger.error(f"지표 계산 오류: {e}")
+
+    return indicators, indicators_series
+
+# ---------- 티커 목록 가져오기 ----------
+@app.get("/tickers")
+async def get_tickers(market: str = "US"):
+    cache_key = f"tickers_{market}"
+    if redis_client:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except redis.RedisError as e:
+            logger.error(f"Redis error: {e}")
+
+    try:
+        if market == "US":
+            symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "JPM", "WMT", "V"]
+            tickers = [
+                {"ticker": symbol, "name": yf.Ticker(symbol).info.get("longName", symbol)}
+                for symbol in symbols
             ]
         else:
-            # US 시장 티커 목록 확장
-            try:
-                # yfinance로 S&P 500 종목 목록 가져오기 (예시)
-                sp500 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
-                ticker_names = [
-                    {"ticker": row['Symbol'], "name": row['Security']}
-                    for _, row in sp500.iterrows()
-                ]
-            except Exception as e:
-                logger.error(f"US 티커 목록 가져오기 실패: {e}")
-                # 기본 인기 종목으로 대체
-                ticker_names = [
-                    {"ticker": "AAPL", "name": "Apple Inc."},
-                    {"ticker": "MSFT", "name": "Microsoft Corporation"},
-                    {"ticker": "TSLA", "name": "Tesla Inc."},
-                    {"ticker": "GOOGL", "name": "Alphabet Inc."},
-                    {"ticker": "AMZN", "name": "Amazon.com Inc."},
-                ]
+            symbols = ["005930", "035720", "000660", "035420", "005380"]
+            tickers = [
+                {"ticker": symbol, "name": KOREAN_TO_ENGLISH.get(stock.get_market_ticker_name(symbol), symbol)}
+                for symbol in symbols
+            ]
 
-        # Redis에 캐싱 (TTL: 1시간)
         if redis_client:
             try:
-                redis_client.setex(cache_key, 3600, json.dumps({"tickers": ticker_names}))
-                logger.info(f"Data cached for {cache_key}")
+                redis_client.setex(cache_key, 3600, json.dumps({"tickers": tickers}))
+                logger.info(f"Tickers cached for {cache_key}")
             except redis.RedisError as e:
-                logger.error(f"Redis error while caching data: {e}")
+                logger.error(f"Redis error while caching tickers: {e}")
 
-        return JSONResponse(content={"tickers": ticker_names}, media_type="application/json; charset=utf-8")
+        return {"tickers": tickers}
+
     except Exception as e:
         logger.error(f"❌ 티커 목록 가져오기 오류: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return {"tickers": []}
 
-@app.get("/ticker_info")
-async def get_ticker_info(ticker: str, market: str = "US"):
-    try:
-        # Redis 캐시 확인
-        if redis_client:
-            cache_key = f"ticker_info:{market}:{ticker}"
-            try:
-                cached_data = redis_client.get(cache_key)
-                if cached_data:
-                    logger.info(f"Cache hit for {cache_key}")
-                    if isinstance(cached_data, bytes):
-                        try:
-                            cached_data = cached_data.decode('utf-8')
-                        except UnicodeDecodeError as e:
-                            logger.error(f"Failed to decode cached data: {e}")
-                            redis_client.delete(cache_key)
-                            logger.info(f"Deleted invalid cache for {cache_key}")
-                            cached_data = None
-                    if cached_data:
-                        return json.loads(cached_data)
-            except (redis.RedisError, json.JSONDecodeError) as e:
-                logger.error(f"Redis cache fetch error: {e}")
-                try:
-                    redis_client.delete(cache_key)
-                    logger.info(f"Deleted invalid cache for {cache_key}")
-                except redis.RedisError as e:
-                    logger.error(f"Redis delete error: {e}")
-
-        # 데이터 가져오기
-        if market == "KR":
-            try:
-                name = stock.get_market_ticker_name(ticker)
-                result = {"ticker": ticker, "name": name or ticker}
-            except Exception as e:
-                logger.error(f"pykrx 데이터 가져오기 실패: {e}")
-                result = {"ticker": ticker, "name": ticker}
-        else:
-            try:
-                ticker_obj = yf.Ticker(ticker)
-                info = ticker_obj.info
-                if not info or "symbol" not in info:
-                    logger.error(f"Invalid Ticker: {ticker}")
-                    return JSONResponse(status_code=400, content={"error": f"유효하지 않은 티커: {ticker}"})
-                name = info.get("longName", ticker)
-                result = {"ticker": ticker, "name": name}
-            except Exception as e:
-                logger.error(f"yfinance 데이터 가져오기 실패: {e}")
-                result = {"ticker": ticker, "name": ticker}
-
-        # Redis에 캐싱 (TTL: 1일)
-        if redis_client:
-            try:
-                redis_client.setex(cache_key, 86400, json.dumps(result))
-                logger.info(f"Data cached for {cache_key}")
-            except redis.RedisError as e:
-                logger.error(f"Redis error while caching data: {e}")
-
-        return result
-    except Exception as e:
-        logger.error(f"❌ 티커 정보 가져오기 오류: {e}")
-        return JSONResponse(status_code=500, content={"ticker": ticker, "name": ticker})
-
+# ---------- 종목 분석 ----------
 @app.get("/analyze")
-async def analyze(ticker: str, market: str = "US", period: str = "3mo"):
+async def analyze(ticker: str, market: str = "US", period: str = "3mo", interval: str = "1d"):
+    cache_key = f"stock_{ticker}_{market}_{period}_{interval}"
+    if redis_client:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except redis.RedisError as e:
+            logger.error(f"Redis error: {e}")
+
     try:
-        # Redis 캐시 확인
-        if redis_client:
-            cache_key = f"analyze:{market}:{ticker}:{period}"
-            try:
-                cached_data = redis_client.get(cache_key)
-                if cached_data:
-                    logger.info(f"Cache hit for {cache_key}")
-                    if isinstance(cached_data, bytes):
-                        try:
-                            cached_data = cached_data.decode('utf-8')
-                        except UnicodeDecodeError as e:
-                            logger.error(f"Failed to decode cached data: {e}")
-                            redis_client.delete(cache_key)
-                            logger.info(f"Deleted invalid cache for {cache_key}")
-                            cached_data = None
-                    if cached_data:
-                        return json.loads(cached_data)
-            except (redis.RedisError, json.JSONDecodeError) as e:
-                logger.error(f"Redis cache fetch error: {e}")
-                try:
-                    redis_client.delete(cache_key)
-                    logger.info(f"Deleted invalid cache for {cache_key}")
-                except redis.RedisError as e:
-                    logger.error(f"Redis delete error: {e}")
-
-        # 데이터 가져오기
-        if market == "KR":
-            end_date = datetime.today().strftime("%Y%m%d")
-            start_date = (datetime.today() - timedelta(days=90)).strftime("%Y%m%d")
-            try:
-                df = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
-                df = df.rename(columns={
-                    "시가": "Open",
-                    "고가": "High",
-                    "저가": "Low",
-                    "종가": "Close",
-                    "거래량": "Volume"
-                })
-                df.index.name = "Date"
-                df.index = pd.to_datetime(df.index)
-                df["Close"] = df["Close"].astype(int)
-            except Exception as e:
-                logger.error(f"pykrx 데이터 가져오기 실패: {e}")
-                return JSONResponse(status_code=400, content={"error": f"데이터 가져오기 실패: {ticker}"})
+        if market == "US":
+            df = fetch_us_ohlc(ticker, period, interval)
         else:
-            try:
-                ticker_obj = yf.Ticker(ticker)
-                info = ticker_obj.info
-                if not info or "symbol" not in info:
-                    logger.error(f"Invalid Ticker: {ticker}")
-                    return JSONResponse(status_code=400, content={"error": f"유효하지 않은 티커: {ticker}"})
-                
-                df = yf.download(ticker, period=period, interval="1d")
-                logger.info(f"US Market - Ticker: {ticker}, Data Preview: {df.head()}")
-                logger.info(f"US Market - Data Length: {len(df)}")
-            except Exception as e:
-                logger.error(f"yfinance 데이터 가져오기 실패: {e}")
-                return JSONResponse(status_code=400, content={"error": f"데이터 가져오기 실패: {ticker}"})
+            df = fetch_kr_ohlc(ticker, period, interval)
 
         if df.empty:
-            logger.error(f"US Market - Empty Data for Ticker: {ticker}")
-            return JSONResponse(status_code=400, content={"error": f"데이터가 비어 있습니다. 티커 {ticker}를 확인하세요."})
+            logger.error(f"Empty DataFrame for {ticker} ({market})")
+            return {"error": "No data available"}
 
-        logger.info(f"US Market - Columns: {df.columns}, Index Type: {type(df.index)}")
-
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.reset_index()
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"])
-                df = df.set_index("Date")
-            else:
-                return JSONResponse(status_code=400, content={"error": "Date 컬럼이 없습니다."})
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        if not isinstance(df.index, pd.DatetimeIndex):
-            return JSONResponse(status_code=400, content={"error": "인덱스가 DateTimeIndex 형식이 아닙니다."})
-
-        required_columns = ["Close", "High", "Low", "Volume"]
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            logger.error(f"Missing columns for {ticker}: {missing_columns}")
-            return JSONResponse(status_code=400, content={"error": f"필수 컬럼 {missing_columns}이 누락되었습니다."})
-
-        df = df.dropna()
-        if df.empty:
-            return JSONResponse(status_code=400, content={"error": "NaN 값을 제거한 후 데이터가 비어 있습니다."})
-
-        df.loc[df["Volume"] == 0, "Volume"] = 1e-6
-        df["Volume"] = df["Volume"].astype(np.float64)
-
-        logger.info(f"데이터 길이: {len(df)}")
-        if len(df) < 50:
-            logger.warning(f"데이터 길이 부족: {len(df)}일 (최소 50일 권장)")
-
-        closes = df["Close"].values.tolist()
-        if market == "KR":
-            closes = [int(x) for x in closes]
-        volumes = df["Volume"].values.tolist()
         dates = df.index.strftime("%Y-%m-%d").tolist()
-        logger.info(f"종가 데이터: {closes[:5]}...")
-        logger.info(f"거래량 데이터: {volumes[:5]}...")
-        logger.info(f"날짜 데이터: {dates[:5]}...")
+        closes = df["Close"].tolist()
+        volumes = df["Volume"].tolist()
 
-        close = np.array(df["Close"].values, dtype=np.float64)
-        high = np.array(df["High"].values, dtype=np.float64)
-        low = np.array(df["Low"].values, dtype=np.float64)
-        volume = df["Volume"].values.astype(np.float64)
-
-        logger.info(f"Close 길이: {len(close)}, High 길이: {len(high)}, Low 길이: {len(low)}, Volume 길이: {len(volume)}")
-
-        for arr, name in [(close, "Close"), (high, "High"), (low, "Low"), (volume, "Volume")]:
-            if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
-                return JSONResponse(status_code=400, content={"error": f"{name} 데이터에 NaN 또는 inf 값이 포함되어 있습니다."})
-
-        indicators = {}
-        indicators_series = {}
-
-        try:
-            rsi = talib.RSI(close, timeperiod=7)
-            indicators["RSI"] = float(rsi[-1]) if len(close) >= 7 else None
-            indicators_series["RSI"] = [float(x) if not np.isnan(x) else None for x in rsi] if len(close) >= 7 else []
-        except Exception as e:
-            logger.error(f"RSI 계산 중 오류: {e}")
-            indicators["RSI"] = None
-            indicators_series["RSI"] = []
-
-        try:
-            macd = talib.MACD(close, fastperiod=6, slowperiod=13, signalperiod=5)
-            indicators["MACD"] = float(macd[0][-1]) if len(close) >= 13 else None
-            indicators["MACD_prev"] = float(macd[0][-2]) if len(close) >= 13 else None
-            indicators_series["MACD"] = [float(x) if not np.isnan(x) else None for x in macd[0]] if len(close) >= 13 else []
-        except Exception as e:
-            logger.error(f"MACD 계산 중 오류: {e}")
-            indicators["MACD"] = None
-            indicators["MACD_prev"] = None
-            indicators_series["MACD"] = []
-
-        try:
-            cci = talib.CCI(high, low, close, timeperiod=7)
-            indicators["CCI"] = float(cci[-1]) if len(close) >= 7 else None
-            indicators_series["CCI"] = [float(x) if not np.isnan(x) else None for x in cci] if len(close) >= 7 else []
-        except Exception as e:
-            logger.error(f"CCI 계산 중 오류: {e}")
-            indicators["CCI"] = None
-            indicators_series["CCI"] = []
-
-        try:
-            mfi = talib.MFI(high, low, close, volume, timeperiod=14)
-            indicators["MFI"] = float(mfi[-1]) if len(close) >= 14 else None
-            indicators_series["MFI"] = [float(x) if not np.isnan(x) else None for x in mfi] if len(close) >= 14 else []
-        except Exception as e:
-            logger.error(f"MFI 계산 중 오류: {e}")
-            indicators["MFI"] = None
-            indicators_series["MFI"] = []
-
-        try:
-            adx = talib.ADX(high, low, close, timeperiod=7)
-            indicators["ADX"] = float(adx[-1]) if len(close) >= 7 else None
-            indicators_series["ADX"] = [float(x) if not np.isnan(x) else None for x in adx] if len(close) >= 7 else []
-        except Exception as e:
-            logger.error(f"ADX 계산 중 오류: {e}")
-            indicators["ADX"] = None
-            indicators_series["ADX"] = []
-
-        try:
-            slowk, slowd = talib.STOCH(high, low, close, fastk_period=7, slowk_period=3, slowd_period=3)
-            indicators["SlowK"] = float(slowk[-1]) if len(close) >= 7 else None
-            indicators["SlowD"] = float(slowd[-1]) if len(close) >= 7 else None
-            indicators["SlowK_prev"] = float(slowk[-2]) if len(close) >= 7 else None
-            indicators["SlowD_prev"] = float(slowd[-2]) if len(close) >= 7 else None
-            indicators_series["SlowK"] = [float(x) if not np.isnan(x) else None for x in slowk] if len(close) >= 7 else []
-            indicators_series["SlowD"] = [float(x) if not np.isnan(x) else None for x in slowd] if len(close) >= 7 else []
-        except Exception as e:
-            logger.error(f"STOCH 계산 중 오류: {e}")
-            indicators["SlowK"] = None
-            indicators["SlowD"] = None
-            indicators["SlowK_prev"] = None
-            indicators["SlowD_prev"] = None
-            indicators_series["SlowK"] = []
-            indicators_series["SlowD"] = []
-
-        try:
-            sma10 = talib.SMA(close, timeperiod=10)
-            sma50 = talib.SMA(close, timeperiod=50)
-            indicators["SMA10"] = float(sma10[-1]) if len(close) >= 10 else None
-            indicators["SMA50"] = float(sma50[-1]) if len(close) >= 50 else None
-            indicators["SMA10_prev"] = float(sma10[-2]) if len(close) >= 10 else None
-            indicators["SMA50_prev"] = float(sma50[-2]) if len(close) >= 50 else None
-            indicators_series["SMA10"] = [float(x) if not np.isnan(x) else None for x in sma10] if len(close) >= 10 else []
-            indicators_series["SMA50"] = [float(x) if not np.isnan(x) else None for x in sma50] if len(close) >= 50 else []
-        except Exception as e:
-            logger.error(f"SMA 계산 중 오류: {e}")
-            indicators["SMA10"] = None
-            indicators["SMA50"] = None
-            indicators["SMA10_prev"] = None
-            indicators["SMA50_prev"] = None
-            indicators_series["SMA10"] = []
-            indicators_series["SMA50"] = []
-
-        try:
-            ema20 = talib.EMA(close, timeperiod=20)
-            ema50 = talib.EMA(close, timeperiod=50)
-            indicators["EMA20"] = float(ema20[-1]) if len(close) >= 20 else None
-            indicators["EMA50"] = float(ema50[-1]) if len(close) >= 50 else None
-            indicators["EMA20_prev"] = float(ema20[-2]) if len(close) >= 20 else None
-            indicators["EMA50_prev"] = float(ema50[-2]) if len(close) >= 50 else None
-            indicators_series["EMA20"] = [float(x) if not np.isnan(x) else None for x in ema20] if len(close) >= 20 else []
-            indicators_series["EMA50"] = [float(x) if not np.isnan(x) else None for x in ema50] if len(close) >= 50 else []
-        except Exception as e:
-            logger.error(f"EMA 계산 중 오류: {e}")
-            indicators["EMA20"] = None
-            indicators["EMA50"] = None
-            indicators["EMA20_prev"] = None
-            indicators["EMA50_prev"] = None
-            indicators_series["EMA20"] = []
-            indicators_series["EMA50"] = []
-
-        try:
-            bb_upper, _, bb_lower = talib.BBANDS(close, timeperiod=14, nbdevup=1.8, nbdevdn=1.8)
-            indicators["BB_upper"] = float(bb_upper[-1]) if len(close) >= 14 else None
-            indicators["BB_lower"] = float(bb_lower[-1]) if len(close) >= 14 else None
-            indicators["BB_upper_prev"] = float(bb_upper[-2]) if len(close) >= 14 else None
-            indicators["BB_lower_prev"] = float(bb_lower[-2]) if len(close) >= 14 else None
-            indicators_series["BB_upper"] = [float(x) if not np.isnan(x) else None for x in bb_upper] if len(close) >= 14 else []
-            indicators_series["BB_lower"] = [float(x) if not np.isnan(x) else None for x in bb_lower] if len(close) >= 14 else []
-        except Exception as e:
-            logger.error(f"BBANDS 계산 중 오류: {e}")
-            indicators["BB_upper"] = None
-            indicators["BB_lower"] = None
-            indicators["BB_upper_prev"] = None
-            indicators["BB_lower_prev"] = None
-            indicators_series["BB_upper"] = []
-            indicators_series["BB_lower"] = []
-
-        try:
-            obv = talib.OBV(close, volume)
-            indicators["OBV"] = float(obv[-1]) if len(close) >= 1 else None
-            indicators["OBV_prev"] = float(obv[-2]) if len(close) >= 2 else None
-        except Exception as e:
-            logger.error(f"OBV 계산 중 오류: {e}")
-            indicators["OBV"] = None
-            indicators["OBV_prev"] = None
-
-        try:
-            atr = talib.ATR(high, low, close, timeperiod=14)
-            indicators["ATR"] = float(atr[-1]) if len(close) >= 14 else None
-        except Exception as e:
-            logger.error(f"ATR 계산 중 오류: {e}")
-            indicators["ATR"] = None
-
-        indicators["Close"] = int(close[-1]) if len(close) >= 1 and market == "KR" else float(close[-1]) if len(close) >= 1 else None
-        indicators["Close_prev"] = int(close[-2]) if len(close) >= 2 and market == "KR" else float(close[-2]) if len(close) >= 2 else None
-
-        indicators = {
-            k: round(v, 3) if v is not None and not np.isnan(v) and k not in ["Close", "Close_prev"] else v
-            for k, v in indicators.items()
-        }
+        indicators, indicators_series = calculate_indicators(df)
 
         result = {
             "dates": dates,
             "closes": closes,
             "volumes": volumes,
-            "indicators": indicators,
-            "indicators_series": indicators_series
+            "indicators": {k: v for k, v in indicators.items() if v is not None},
+            "indicatorsSeries": {k: v for k, v in indicators_series.items() if v and any(x is not None for x in v)},
         }
 
-        # Redis에 캐싱 (TTL: 5분)
+        # Firestore에 저장
+        try:
+            db.collection('stocks').document(f"{market}-{ticker}").set({
+                'dates': dates,
+                'closes': closes,
+                'volumes': volumes,
+                'indicators': {k: v for k, v in indicators.items() if v is not None},
+                'indicatorsSeries': {k: v for k, v in indicators_series.items() if v and any(x is not None for x in v)},
+                'updatedAt': datetime.utcnow().isoformat(),
+            })
+            logger.info(f"Saved stock data to Firestore for {market}-{ticker}")
+        except Exception as e:
+            logger.error(f"Failed to save stock data to Firestore for {market}-{ticker}: {e}")
+
         if redis_client:
             try:
-                redis_client.setex(cache_key, 300, json.dumps(result))
+                redis_client.setex(cache_key, 1800, json.dumps(result))
                 logger.info(f"Data cached for {cache_key}")
             except redis.RedisError as e:
                 logger.error(f"Redis error while caching data: {e}")
 
+        logger.info(f"Analyze result for {ticker} ({market}): indicators={result['indicators']}")
         return result
 
     except Exception as e:
-        logger.error(f"❌ 데이터 분석 중 오류 발생: {e}")
+        logger.error(f"❌ 분석 중 오류 발생: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+# ---------- 뉴스 가져오기 ----------
 @app.get("/news")
 async def get_news(ticker: str, market: str = "US", start: int = 1, display: int = 10):
-    try:
-        if redis_client:
-            cache_key = f"news:{market}:{ticker}:{start}:{display}"
-            try:
-                cached_data = redis_client.get(cache_key)
-                if cached_data:
-                    logger.info(f"Cache hit for {cache_key}")
-                    if isinstance(cached_data, bytes):
-                        try:
-                            cached_data = cached_data.decode('utf-8')
-                        except UnicodeDecodeError as e:
-                            logger.error(f"Failed to decode cached data: {e}")
-                            redis_client.delete(cache_key)
-                            logger.info(f"Deleted invalid cache for {cache_key}")
-                            cached_data = None
-                    if cached_data:
-                        return json.loads(cached_data)
-            except (redis.RedisError, json.JSONDecodeError) as e:
-                logger.error(f"Redis cache fetch error: {e}")
-                try:
-                    redis_client.delete(cache_key)
-                    logger.info(f"Deleted invalid cache for {cache_key}")
-                except redis.RedisError as e:
-                    logger.error(f"Redis delete error: {e}")
-
-        query = ticker
-        if market == "KR":
-            try:
-                korean_name = stock.get_market_ticker_name(ticker) or ticker
-                query = f"{korean_name} 뉴스"
-                logger.info(f"KR 종목명: {korean_name}, 검색 쿼리: {query}")
-            except Exception as e:
-                logger.error(f"pykrx 종목명 가져오기 실패: {e}")
-                query = f"{ticker} 뉴스"
-
-        url = "https://openapi.naver.com/v1/search/news.json"
-        headers = {
-            "X-Naver-Client-Id": "hGsBkHMZAIdA274Yf1HM",  # 네이버 개발자 센터에서 발급받은 키로 교체
-            "X-Naver-Client-Secret": "DATh9ARioQ"  # 네이버 개발자 센터에서 발급받은 키로 교체
-        }
-        params = {
-            "query": query,
-            "display": min(display, 100),
-            "start": start,
-            "sort": "date"
-        }
-
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code != 200:
-            logger.error(f"❌ 네이버 뉴스 API 요청 실패: {response.status_code} - {response.text}")
-            return {"news": [], "total": 0}
-
+    cache_key = f"news_{ticker}_{market}_{start}_{display}"
+    if redis_client:
         try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except redis.RedisError as e:
+            logger.error(f"Redis error: {e}")
+
+    try:
+        articles = []
+        total = 0
+        if market == "KR":
+            # 네이버 뉴스 API 사용
+            client_id = "hGsBkHMZAIdA274Yf1HM"  # 네이버 개발자 센터에서 발급
+            client_secret = "DATh9ARioQ"  # 네이버 개발자 센터에서 발급
+            query = KOREAN_TO_ENGLISH.get(stock.get_market_ticker_name(ticker), ticker)
+            url = "https://openapi.naver.com/v1/search/news.json"
+            headers = {
+                "X-Naver-Client-Id": client_id,
+                "X-Naver-Client-Secret": client_secret,
+            }
+            params = {
+                "query": query,
+                "start": start,
+                "display": display,
+                "sort": "date",
+            }
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
             data = response.json()
-            logger.info(f"Naver API response: {data.get('items', [])[:2]}")
-        except ValueError as e:
-            logger.error(f"네이버 API 응답 파싱 실패: {e} - {response.text}")
-            return {"news": [], "total": 0}
+            articles = [
+                {
+                    "title": item.get("title", "제목 없음").replace('<b>', '').replace('</b>', ''),
+                    "url": item.get("link", ""),
+                    "pubDate": item.get("pubDate", ""),
+                }
+                for item in data.get("items", [])
+            ]
+            total = data.get("total", 0)
+            logger.info(f"Naver news API response for {ticker}: {len(articles)} articles, total={total}")
+        else:
+            # 야후 뉴스 크롤링
+            query = yf.Ticker(ticker).info.get("longName", ticker).replace(' ', '+')
+            url = f"https://news.search.yahoo.com/search?p={query}&b={start}&pz={display}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            news_items = soup.select('div.news-card')[:display]  # 2025년 기준 클래스 확인 필요
+            for item in news_items:
+                title_elem = item.select_one('h4.s-title > a')
+                date_elem = item.select_one('span.s-time')
+                title = title_elem.text.strip() if title_elem else "제목 없음"
+                url = title_elem['href'] if title_elem and title_elem.get('href') else ""
+                date = date_elem.text.strip() if date_elem else "날짜 없음"
+                articles.append({
+                    "title": title,
+                    "url": url,
+                    "pubDate": date,
+                })
+            total = 100  # 추정치, 실제 파싱 필요 시 수정
+            logger.info(f"Yahoo news scraped for {ticker}: {len(articles)} articles")
 
-        articles = data.get('items', [])
-        total = data.get('total', 0)
-        if not articles:
-            logger.warning(f"네이버 API에서 뉴스 데이터 없음: {data}")
-
-        positive_keywords = ['상승', '호재', '성장', '기대', '성공', '수익', '좋은', '긍정', '회복', '강세', 'increase', 'positive', 'growth', 'success', 'profit']
-        negative_keywords = ['하락', '악재', '침체', '우려', '부진', '손실', '나쁜', '부정', '약세', '위기', 'decrease', 'negative', 'decline', 'loss', 'crisis']
-
+        positive_keywords = ["growth", "surge", "rise", "bullish", "profit", "상승", "성장", "호재"]
+        negative_keywords = ["drop", "decline", "bearish", "loss", "crash", "하락", "악재"]
         news_list = [
             {
-                "title": article.get('title', '제목 없음').replace('<b>', '').replace('</b>', '') if article.get('title') else '제목 없음',
-                "link": article.get('link', ''),
-                "pubDate": article.get('pubDate', ''),
+                "title": article.get("title", "제목 없음"),
+                "url": article.get("url", ""),
+                "pubDate": article.get("pubDate", ""),
                 "sentiment": (
-                    "긍정" if article.get('title') and any(keyword in article.get('title', '').lower() for keyword in positive_keywords) and
+                    "긍정" if any(keyword in article.get('title', '').lower() for keyword in positive_keywords) and
                     not any(keyword in article.get('title', '').lower() for keyword in negative_keywords) else
-                    "부정" if article.get('title') and any(keyword in article.get('title', '').lower() for keyword in negative_keywords) and
+                    "부정" if any(keyword in article.get('title', '').lower() for keyword in negative_keywords) and
                     not any(keyword in article.get('title', '').lower() for keyword in positive_keywords) else
                     "중립"
                 ),
                 "color": (
-                    "#00FF00" if article.get('title') and any(keyword in article.get('title', '').lower() for keyword in positive_keywords) and
+                    "#00FF00" if any(keyword in article.get('title', '').lower() for keyword in positive_keywords) and
                     not any(keyword in article.get('title', '').lower() for keyword in negative_keywords) else
-                    "#FF0000" if article.get('title') and any(keyword in article.get('title', '').lower() for keyword in negative_keywords) and
+                    "#FF0000" if any(keyword in article.get('title', '').lower() for keyword in negative_keywords) and
                     not any(keyword in article.get('title', '').lower() for keyword in positive_keywords) else
                     "#FFFF00"
                 )
@@ -583,6 +448,7 @@ async def get_news(ticker: str, market: str = "US", start: int = 1, display: int
         logger.error(f"❌ 뉴스 데이터 가져오기 오류: {e}")
         return {"news": [], "total": 0}
 
+# ---------- 변동률 비교 ----------
 @app.get("/compare")
 async def compare(ticker: str, market: str = "US"):
     try:
@@ -596,7 +462,7 @@ async def compare(ticker: str, market: str = "US"):
                 try:
                     df = stock.get_market_ohlcv_by_date(start_date, end_date, t)
                     df = df.rename(columns={"종가": "Close"})
-                    df["Close"] = df["Close"].astype(int)
+                    df["Close"] = df["Close"].astype(float)
                 except Exception as e:
                     logger.error(f"pykrx 데이터 가져오기 실패 for {t}: {e}")
                     changes[t] = 0.0
@@ -608,7 +474,7 @@ async def compare(ticker: str, market: str = "US"):
                     logger.error(f"yfinance 데이터 가져오기 실패 for {t}: {e}")
                     changes[t] = 0.0
                     continue
-            
+
             if df.empty:
                 logger.error(f"Empty data for {t} in compare endpoint")
                 changes[t] = 0.0
@@ -630,3 +496,37 @@ async def compare(ticker: str, market: str = "US"):
     except Exception as e:
         logger.error(f"❌ 변동률 비교 중 오류 발생: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ---------- 종목 정보 가져오기 ----------
+@app.get("/ticker_info")
+async def get_ticker_info(ticker: str, market: str = "US"):
+    cache_key = f"ticker_info_{ticker}_{market}"
+    if redis_client:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except redis.RedisError as e:
+            logger.error(f"Redis error: {e}")
+
+    try:
+        if market == "US":
+            info = yf.Ticker(ticker).info
+            name = info.get("longName", ticker)
+        else:
+            name = KOREAN_TO_ENGLISH.get(stock.get_market_ticker_name(ticker), ticker)
+
+        result = {"name": name}
+
+        if redis_client:
+            try:
+                redis_client.setex(cache_key, 3600, json.dumps(result))
+                logger.info(f"Ticker info cached for {cache_key}")
+            except redis.RedisError as e:
+                logger.error(f"Redis error while caching ticker info: {e}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ 종목 정보 가져오기 오류: {e}")
+        return {"name": ticker}

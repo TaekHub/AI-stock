@@ -1,7 +1,6 @@
-// 파일명: ticker_search.dart
 import 'package:flutter/material.dart';
-import 'package:stock_analysis_app/main.dart';
-import 'package:stock_analysis_app/services/api.dart';
+import '../services/api.dart';
+import '../main.dart';
 
 class TickerSearch extends StatefulWidget {
   final String market;
@@ -9,6 +8,7 @@ class TickerSearch extends StatefulWidget {
   final Function(int) onIndexChanged;
   final Function(Map<String, dynamic>) toggleFavorite;
   final List<Map<String, dynamic>> favoriteStocks;
+  final Function(String)? onSelect;
 
   const TickerSearch({
     super.key,
@@ -17,6 +17,7 @@ class TickerSearch extends StatefulWidget {
     required this.onIndexChanged,
     required this.toggleFavorite,
     required this.favoriteStocks,
+    this.onSelect,
   });
 
   @override
@@ -25,105 +26,50 @@ class TickerSearch extends StatefulWidget {
 
 class _TickerSearchState extends State<TickerSearch> {
   final TextEditingController _controller = TextEditingController();
-  List<Map<String, String>> _suggestions = [];
-  List<Map<String, String>> _allTickers = [];
-  bool _isLoading = false;
-  String? _errorMessage;
+  List<Map<String, dynamic>> searchResults = [];
+  bool isLoading = false;
 
   @override
-  void initState() {
-    super.initState();
-    _loadSuggestions();
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
   }
 
-  Future<void> _loadSuggestions() async {
-    setState(() {
-      _isLoading = true;
-      _errorMessage = null;
-    });
-    try {
-      final tickers = await fetchTickers(widget.market);
-      print('Loaded tickers for market ${widget.market}: $tickers'); // 디버깅 로그 추가
-      setState(() {
-        _allTickers = tickers;
-        _suggestions = tickers;
-        _isLoading = false;
-      });
-    } catch (e) {
-      print('티커 검색 로드 실패 (${widget.market}): $e'); // 디버깅 로그 추가
-      setState(() {
-        _errorMessage = widget.market == 'KR'
-            ? '국내 주식 데이터를 불러올 수 없습니다.'
-            : '해외 주식 데이터를 불러올 수 없습니다.';
-        _isLoading = false;
-      });
-    }
-  }
-
-  void _onSearch(String query) {
+  Future<void> searchTickers(String query) async {
     if (query.isEmpty) {
       setState(() {
-        _suggestions = _allTickers;
+        searchResults = [];
       });
       return;
     }
-
-    final queryLower = query.toLowerCase();
-    final filtered = _allTickers.where((ticker) {
-      final tickerLower = ticker['ticker']!.toLowerCase();
-      final nameLower = ticker['name']!.toLowerCase();
-      return tickerLower.contains(queryLower) || nameLower.contains(queryLower);
-    }).toList();
-
-    filtered.sort((a, b) {
-      final aName = a['name']!.toLowerCase();
-      final bName = b['name']!.toLowerCase();
-      if (aName.startsWith(queryLower) && !bName.startsWith(queryLower)) {
-        return -1;
-      } else if (!aName.startsWith(queryLower) && bName.startsWith(queryLower)) {
-        return 1;
-      }
-      return aName.compareTo(bName);
-    });
-
     setState(() {
-      _suggestions = filtered;
+      isLoading = true;
     });
-  }
-
-  void _onTickerSelected(String ticker, String name) {
-    _controller.clear();
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => StockHomePage(
-          ticker: ticker,
-          market: widget.market,
-          selectedIndex: widget.selectedIndex,
-          onIndexChanged: widget.onIndexChanged,
-          toggleFavorite: widget.toggleFavorite,
-          favoriteStocks: widget.favoriteStocks,
-        ),
-      ),
-    );
-  }
-
-  void _onCustomTickerSubmitted(String query) {
-    if (query.isNotEmpty) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (context) => StockHomePage(
-            ticker: query.toUpperCase(),
-            market: widget.market,
-            selectedIndex: widget.selectedIndex,
-            onIndexChanged: widget.onIndexChanged,
-            toggleFavorite: widget.toggleFavorite,
-            favoriteStocks: widget.favoriteStocks,
-          ),
-        ),
+    try {
+      final data = await fetchTickers(widget.market) as Map<String, dynamic>;
+      print('Ticker search data: $data'); // 디버깅 로그
+      setState(() {
+        final tickerList = data['tickers'] as List<dynamic>? ?? [];
+        print('Ticker list: $tickerList'); // 추가 로그
+        searchResults = tickerList
+            .where((ticker) {
+          final tickerData = ticker as Map<String, dynamic>;
+          final tickerString = tickerData['ticker']?.toString().toLowerCase() ?? '';
+          final nameString = tickerData['name']?.toString().toLowerCase() ?? '';
+          return tickerString.contains(query.toLowerCase()) || nameString.contains(query.toLowerCase());
+        })
+            .cast<Map<String, dynamic>>()
+            .toList();
+        isLoading = false;
+      });
+    } catch (e) {
+      print('Error searching tickers: $e');
+      setState(() {
+        isLoading = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('검색 실패: $e')),
       );
-      _controller.clear();
     }
   }
 
@@ -136,89 +82,78 @@ class _TickerSearchState extends State<TickerSearch> {
           TextField(
             controller: _controller,
             decoration: InputDecoration(
-              labelText: '종목 검색',
-              labelStyle: const TextStyle(color: Colors.white70),
+              hintText: '종목 검색...',
+              hintStyle: const TextStyle(color: Colors.white70),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: Colors.blueAccent),
               ),
               suffixIcon: IconButton(
-                icon: const Icon(Icons.search, color: Colors.white),
-                onPressed: () => _onCustomTickerSubmitted(_controller.text),
+                icon: const Icon(Icons.clear, color: Colors.white70),
+                onPressed: () {
+                  _controller.clear();
+                  searchTickers('');
+                },
               ),
             ),
             style: const TextStyle(color: Colors.white),
-            onChanged: _onSearch,
-            onSubmitted: _onCustomTickerSubmitted,
+            onChanged: searchTickers,
           ),
-          const SizedBox(height: 16),
-          _isLoading
-              ? const Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                CircularProgressIndicator(color: Colors.blueAccent),
-                SizedBox(height: 16),
-                Text(
-                  '데이터를 불러오는 중입니다',
-                  style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500),
-                ),
-              ],
-            ),
-          )
-              : _errorMessage != null
-              ? Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.error_outline, color: Colors.redAccent, size: 40),
-                const SizedBox(height: 16),
-                Text(
-                  _errorMessage!,
-                  style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500),
-                ),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: _loadSuggestions,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blueAccent,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
+          if (isLoading)
+            const Center(child: CircularProgressIndicator(color: Colors.blueAccent)),
+          if (searchResults.isNotEmpty)
+            Expanded(
+              child: ListView.builder(
+                itemCount: searchResults.length,
+                itemBuilder: (context, index) {
+                  final ticker = searchResults[index];
+                  final isFavorite = widget.favoriteStocks.any(
+                          (item) => item['ticker'] == ticker['ticker'] && item['market'] == widget.market);
+                  return ListTile(
+                    title: Text(
+                      ticker['name'] ?? ticker['ticker'] ?? 'Unknown',
+                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500),
                     ),
-                  ),
-                  child: const Text('재시도'),
-                ),
-              ],
+                    subtitle: Text(
+                      ticker['ticker']?.toString() ?? 'Unknown',
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                    trailing: IconButton(
+                      icon: Icon(
+                        isFavorite ? Icons.star : Icons.star_border,
+                        color: isFavorite ? Colors.yellow : Colors.grey,
+                      ),
+                      onPressed: () {
+                        widget.toggleFavorite({
+                          'ticker': ticker['ticker'],
+                          'market': widget.market,
+                          'name': ticker['name'] ?? ticker['ticker'] ?? 'Unknown',
+                        });
+                      },
+                    ),
+                    onTap: () {
+                      final tickerId = ticker['ticker'] as String?;
+                      if (tickerId != null) {
+                        widget.onSelect?.call(tickerId);
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) => StockHomePage(
+                              ticker: tickerId,
+                              market: widget.market,
+                              selectedIndex: widget.selectedIndex,
+                              onIndexChanged: widget.onIndexChanged,
+                              toggleFavorite: widget.toggleFavorite,
+                              favoriteStocks: widget.favoriteStocks,
+                            ),
+                          ),
+                        );
+                      }
+                    },
+                  );
+                },
+              ),
             ),
-          )
-              : _suggestions.isEmpty
-              ? const Text(
-            '검색 결과가 없습니다.',
-            style: TextStyle(color: Colors.white),
-          )
-              : SizedBox(
-            height: 200,
-            child: ListView.builder(
-              itemCount: _suggestions.length,
-              itemBuilder: (context, index) {
-                final ticker = _suggestions[index];
-                return ListTile(
-                  title: Text(
-                    '${ticker['name']} (${ticker['ticker']})',
-                    style: const TextStyle(color: Colors.white),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                  ),
-                  subtitle: Text(
-                    '시장: ${widget.market}',
-                    style: const TextStyle(color: Colors.white70, fontSize: 12),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                  ),
-                  onTap: () => _onTickerSelected(ticker['ticker']!, ticker['name']!),
-                );
-              },
-            ),
-          ),
         ],
       ),
     );

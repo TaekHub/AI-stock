@@ -56,41 +56,26 @@ Future<Map<String, dynamic>> fetchStockData(String ticker, String market, {Strin
 }
 
 Future<Map<String, dynamic>> fetchNews(String ticker, String market, {int start = 1, int display = 10}) async {
-  final url = Uri.parse('$baseUrl/news?ticker=$ticker&market=$market&start=$start&display=$display');
   return await retry(
         () async {
-      try {
-        final response = await http.get(url);
-        print('News API response for $ticker ($market, start=$start, display=$display): ${response.statusCode}');
-        if (response.statusCode == 200) {
-          final decodedBody = utf8.decode(response.bodyBytes);
-          final data = jsonDecode(decodedBody);
-          if (data is Map<String, dynamic> && data['news'] is List) {
-            return {
-              'news': List<Map<String, dynamic>>.from(data['news'].map((item) => {
-                'title': item['title']?.toString() ?? '제목 없음',
-                'url': item['link']?.toString() ?? '',
-                'pubDate': item['pubDate']?.toString() ?? '',
-                'sentiment': item['sentiment']?.toString() ?? '중립',
-                'color': item['color'] != null
-                    ? Color(int.parse(item['color'].replaceFirst('#', '0xFF')))
-                    : Colors.yellow,
-              })),
-              'total': data['total'] ?? 0,
-            };
-          } else {
-            throw Exception('Invalid news data format: ${data.toString()}');
-          }
+      final response = await http.get(
+        Uri.parse('$baseUrl/news?ticker=$ticker&market=$market&start=$start&display=$display'),
+      );
+      print('News API response for $ticker ($market, start=$start, display=$display): ${response.statusCode}');
+      if (response.statusCode == 200) {
+        final decodedBody = utf8.decode(response.bodyBytes);
+        final data = jsonDecode(decodedBody);
+        if (data is Map<String, dynamic>) {
+          return data;
         } else {
-          throw Exception('Failed to load news: ${response.statusCode} - ${response.body}');
+          throw Exception('Invalid news data format');
         }
-      } catch (e) {
-        print('News fetch error: $e');
-        throw Exception('Failed to fetch news: $e');
+      } else {
+        throw Exception('Failed to load news: ${response.statusCode} - ${response.body}');
       }
     },
     maxAttempts: 3,
-    delayFactor: const Duration(seconds: 1),
+    delayFactor: Duration(seconds: 1),
   );
 }
 

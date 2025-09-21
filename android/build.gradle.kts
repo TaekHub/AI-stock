@@ -1,7 +1,9 @@
+// android/build.gradle.kts (루트)
 plugins {
-    id("com.android.application") version "8.7.0" apply false
-    id("org.jetbrains.kotlin.android") version "2.0.0" apply false
-    id("com.google.gms.google-services") version "4.4.3" apply false
+    id("com.android.application") apply false
+    id("org.jetbrains.kotlin.android") apply false
+    id("com.google.gms.google-services") apply false
+    // (선택) id("com.google.firebase.appdistribution") apply false
 }
 
 allprojects {
@@ -22,6 +24,6 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
-tasks.register<Delete>("clean") {
-    delete(rootProject.layout.buildDirectory)
-}
+//tasks.register<Delete>("clean") {cmd
+//    delete(rootProject.layout.buildDirectory)
+//}

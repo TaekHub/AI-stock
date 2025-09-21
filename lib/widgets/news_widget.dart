@@ -7,7 +7,11 @@ class NewsWidget extends StatefulWidget {
   final String ticker;
   final String market;
 
-  const NewsWidget({super.key, required this.ticker, required this.market});
+  const NewsWidget({
+    super.key,
+    required this.ticker,
+    required this.market,
+  });
 
   @override
   State<NewsWidget> createState() => _NewsWidgetState();
@@ -15,54 +19,66 @@ class NewsWidget extends StatefulWidget {
 
 class _NewsWidgetState extends State<NewsWidget> {
   List<Map<String, dynamic>> news = [];
-  int currentPage = 1;
-  final int itemsPerPage = 10;
-  int totalItems = 0;
-  bool isLoading = false;
-  final int maxPages = 10; // 최대 100개 뉴스 ÷ 10개 per page
+  bool isLoading = true;
+  String? errorMessage;
+  int start = 1;
+  final int display = 10;
+  int total = 0;
+  final int maxPages = 10;
 
   @override
   void initState() {
     super.initState();
-    _fetchNews(currentPage);
+    loadNews();
   }
 
-  Future<void> _fetchNews(int page) async {
-    if (isLoading) return;
-    setState(() {
-      isLoading = true;
-      news.clear(); // 새 페이지 로드 시 기존 데이터 초기화
-    });
+  Future<void> loadNews({bool loadMore = false}) async {
+    if (!loadMore) {
+      setState(() {
+        isLoading = true;
+        errorMessage = null;
+      });
+    }
     try {
-      final response = await fetchNews(
+      final data = await fetchNews(
         widget.ticker,
         widget.market,
-        start: (page - 1) * itemsPerPage + 1,
-        display: itemsPerPage,
+        start: loadMore ? start + display : 1,
+        display: display,
       );
+      print('News data for ${widget.ticker} (${widget.market}): $data');
       setState(() {
-        news = response['news'];
-        totalItems = response['total'] ?? 0;
-        currentPage = page;
+        if (!loadMore) {
+          news = List<Map<String, dynamic>>.from(data['news'] ?? []);
+        } else {
+          news.addAll(List<Map<String, dynamic>>.from(data['news'] ?? []));
+        }
+        start = loadMore ? start + display : 1;
+        total = data['total'] ?? 0;
         isLoading = false;
       });
-      print('News loaded for page $page: ${news.length} items, total: $totalItems');
     } catch (e) {
+      print('Error loading news: $e');
       setState(() {
+        errorMessage = e.toString();
         isLoading = false;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('뉴스 로드 실패: $e')),
-      );
-      print('News fetch error: $e');
     }
   }
 
-  Future<void> _launchURL(String url) async {
-    final Uri uri = Uri.parse(url);
+  Future<void> launchURL(String url) async {
+    if (url.isEmpty) {
+      print('Empty URL attempted to launch');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('유효한 링크가 없습니다')),
+      );
+      return;
+    }
+    final uri = Uri.parse(url);
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     } else {
+      print('Cannot launch URL: $url');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('링크를 열 수 없습니다: $url')),
       );
@@ -73,160 +89,128 @@ class _NewsWidgetState extends State<NewsWidget> {
   Widget build(BuildContext context) {
     double screenWidth = MediaQuery.of(context).size.width;
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(12.0),
-          child: Text(
-            '뉴스 (${news.length}/$totalItems)',
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: screenWidth * 0.045,
-              fontWeight: FontWeight.bold,
+    if (isLoading && news.isEmpty) {
+      return const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(color: Colors.blueAccent),
+            SizedBox(height: 16),
+            Text(
+              '뉴스를 불러오는 중입니다',
+              style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500),
             ),
-          ),
+          ],
         ),
-        Expanded(
-          child: isLoading
-              ? const Center(
-            child: Padding(
-              padding: EdgeInsets.all(16.0),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  CircularProgressIndicator(color: Colors.blueAccent),
-                  SizedBox(height: 16),
-                  Text(
-                    '뉴스 데이터를 불러오는 중입니다',
-                    style: TextStyle(color: Colors.white, fontSize: 16),
-                  ),
-                ],
+      );
+    }
+
+    if (errorMessage != null) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.error_outline, color: Colors.redAccent, size: 40),
+            const SizedBox(height: 16),
+            Text(
+              '뉴스를 불러올 수 없습니다',
+              style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              errorMessage!,
+              style: const TextStyle(color: Colors.white70, fontSize: 14),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: () => loadNews(),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blueAccent,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               ),
+              child: const Text('재시도'),
             ),
-          )
-              : news.isEmpty
-              ? Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Text(
-                  '뉴스를 불러올 수 없습니다.',
-                  style: TextStyle(color: Colors.white, fontSize: 16),
-                ),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: () => _fetchNews(currentPage),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blueAccent,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  ),
-                  child: const Text('재시도'),
-                ),
-              ],
+          ],
+        ),
+      );
+    }
+
+    if (news.isEmpty) {
+      return const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.info_outline, color: Colors.white70, size: 40),
+            SizedBox(height: 16),
+            Text(
+              '뉴스가 없습니다',
+              style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500),
             ),
-          )
-              : ListView.builder(
-            physics: const AlwaysScrollableScrollPhysics(),
+          ],
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        Expanded(
+          child: ListView.builder(
             itemCount: news.length,
             itemBuilder: (context, index) {
-              final article = news[index];
-              return Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4.0, horizontal: 12.0),
-                child: Card(
-                  color: Colors.grey[850],
-                  elevation: 4,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+              final item = news[index];
+              final url = item['url']?.toString() ?? '';
+              return Card(
+                color: Colors.grey[850],
+                margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                child: ListTile(
+                  title: Text(
+                    item['title']?.toString() ?? '제목 없음',
+                    style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 2,
                   ),
-                  child: ListTile(
-                    title: Text(
-                      article['title'] ?? '제목 없음',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: screenWidth * 0.04,
-                        fontWeight: FontWeight.w600,
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item['pubDate']?.toString() ?? '날짜 없음',
+                        style: const TextStyle(color: Colors.white70, fontSize: 12),
                       ),
-                    ),
-                    subtitle: Padding(
-                      padding: const EdgeInsets.only(top: 8.0),
-                      child: Row(
-                        children: [
-                          Text(
-                            article['pubDate']?.split(' ').sublist(0, 4).join(' ') ?? '날짜 없음',
-                            style: TextStyle(
-                              color: Colors.white70,
-                              fontSize: screenWidth * 0.035,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: (article['color'] as Color?)?.withOpacity(0.2) ?? Colors.yellow.withOpacity(0.2),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Text(
-                              article['sentiment'] ?? '중립',
-                              style: TextStyle(
-                                color: article['color'] as Color? ?? Colors.yellow,
-                                fontSize: screenWidth * 0.035,
-                              ),
-                            ),
-                          ),
-                        ],
+                      Text(
+                        item['sentiment']?.toString() ?? '중립',
+                        style: TextStyle(
+                          color: item['color'] is String
+                              ? Color(int.parse(item['color'].replaceFirst('#', '0xFF')))
+                              : (item['color'] is Color ? item['color'] as Color : Colors.yellow),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                        ),
                       ),
-                    ),
-                    onTap: () async {
-                      final url = article['url'] as String?;
-                      if (url != null && url.isNotEmpty) {
-                        try {
-                          await _launchURL(url);
-                        } catch (e) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text('링크를 열 수 없습니다: $e')),
-                          );
-                        }
-                      } else {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('유효한 링크가 없습니다.')),
-                        );
-                      }
-                    },
+                    ],
                   ),
+                  onTap: () => launchURL(url),
                 ),
               );
             },
           ),
         ),
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: List.generate(maxPages, (index) {
-              final page = index + 1;
-              return Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4.0),
-                child: ElevatedButton(
-                  onPressed: isLoading || page == currentPage ? null : () => _fetchNews(page),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: page == currentPage ? Colors.blueAccent : Colors.grey[700],
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8), // 버튼 크기 축소
-                    minimumSize: Size(screenWidth * 0.1, 36), // 최소 크기 설정
-                  ),
-                  child: Text(
-                    '$page',
-                    style: TextStyle(
-                      color: page == currentPage ? Colors.white : Colors.white70,
-                      fontSize: screenWidth * 0.035, // 글씨 크기 축소
-                    ),
-                  ),
-                ),
-              );
-            }),
+        if (start + display <= total && start + display <= maxPages * display)
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: ElevatedButton(
+              onPressed: () => loadNews(loadMore: true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blueAccent,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              child: Text(
+                '더 보기 (${(start + display) ~/ display}/${maxPages})',
+                style: TextStyle(fontSize: screenWidth * 0.04, fontWeight: FontWeight.bold),
+              ),
+            ),
           ),
-        ),
       ],
     );
   }
